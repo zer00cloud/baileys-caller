@@ -26,7 +26,7 @@ export declare class ActiveCall extends EventEmitter {
     _audioSource: string;
     constructor(callId: string, engine: WasmEngine, durationMs: number, direction?: "outbound" | "inbound", from?: string | undefined);
     get state(): CallState;
-    end: () => void;
+    end: (reason?: string) => void;
     mute: (muted: boolean) => void;
     answer: (opts?: {
         mic?: boolean;

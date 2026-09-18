@@ -202,6 +202,9 @@ export class WasmEngine {
         }
         set.add(handler);
     };
+    static removeGlobalCallbackListener = (callbackName, handler) => {
+        _a.#globalCallbackListeners.get(`callback:${callbackName}`)?.delete(handler);
+    };
     static notifyGlobalCallbackListeners = (callbackName, data) => {
         const set = _a.#globalCallbackListeners.get(`callback:${callbackName}`);
         if (!set)
@@ -235,6 +238,7 @@ export class WasmEngine {
     #voipReadyPromise = null;
     #workerModulesCode = "";
     #loaderCode = "";
+    #registeredGlobalHandlers = [];
     constructor(config = {}) {
         const basePath = config.resourcesPath
             ? (path.isAbsolute(config.resourcesPath) ? config.resourcesPath : path.resolve(process.cwd(), config.resourcesPath))
@@ -315,8 +319,15 @@ export class WasmEngine {
         if (typeof wasmLoader !== "function") {
             throw new Error(`No compatible WASM loader found. Tried: ${loaderModuleNames.join(", ")}`);
         }
-        if (!_a.#globalCallbacksRegistered)
+        if (!_a.#globalCallbacksRegistered) {
             this.#registerGlobalCallbacks();
+            _a.#globalCallbacksRegistered = true;
+        }
+        else {
+            // Engine baru (mis. setelah disconnect/connect ulang) tetap harus
+            // mendaftarkan callback-nya sendiri, kalau tidak event WASM hilang.
+            this.#registerGlobalCallbacks();
+        }
         await this.#initPThreadPool();
         const workersLoadingPromise = this.#loadWasmModuleToAllWorkers();
         const readyPromise = wasmLoader({
@@ -332,6 +343,13 @@ export class WasmEngine {
     isInitialized = () => this.#initialized;
     destroy = () => {
         this.#stopAudioPlaybackLoop();
+        for (const { name, handler } of this.#registeredGlobalHandlers) {
+            try {
+                _a.removeGlobalCallbackListener(name, handler);
+            }
+            catch { }
+        }
+        this.#registeredGlobalHandlers = [];
         if (this.#instance && typeof this.#instance.endCall === "function") {
             try {
                 this.#instance.endCall(0, false);
@@ -578,8 +596,11 @@ export class WasmEngine {
         return list;
     };
     #startAudioPlaybackLoop = () => {
+        // Panggilan ke-3/4 kadang start tanpa stop yang bersih dari WASM —
+        // loop lama (buffer basi) bikin audio cuma 1 frame lalu diam.
+        // Restart selalu agar buffer fresh tiap panggilan.
         if (this.#audioPlaybackLoopInterval)
-            return;
+            this.#stopAudioPlaybackLoop();
         this.#ensureInitialized();
         this.#isPlaybackActive = true;
         if (typeof this.#instance.requestAudioDataFromWasmVoip !== "function")
@@ -762,7 +783,11 @@ export class WasmEngine {
     };
     #registerGlobalCallbacks = () => {
         const callbacks = this.#config.callbacks ?? {};
-        _a.registerGlobalCallbackListener("loggingCallback", (data) => {
+        const on = (name, handler) => {
+            _a.registerGlobalCallbackListener(name, handler);
+            this.#registeredGlobalHandlers.push({ name, handler });
+        };
+        on("loggingCallback", (data) => {
             if (!this.#config.enableLogs)
                 return;
             const level = data?.level;
@@ -771,7 +796,7 @@ export class WasmEngine {
             callbacks.onLog?.(mapped, msg);
         });
         if (callbacks.onAudioCaptureInit) {
-            _a.registerGlobalCallbackListener("initCaptureDriverJS", (data) => {
+            on("initCaptureDriverJS", (data) => {
                 callbacks.onAudioCaptureInit({
                     sampleRate: data?.sample_rate ?? data?.sampleRate,
                     channels: data?.channels,
@@ -780,10 +805,10 @@ export class WasmEngine {
                 });
             });
         }
-        _a.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
-        _a.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
+        on("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
+        on("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
         if (callbacks.onAudioPlaybackInit) {
-            _a.registerGlobalCallbackListener("initPlaybackDriverJS", (data) => {
+            on("initPlaybackDriverJS", (data) => {
                 callbacks.onAudioPlaybackInit({
                     sampleRate: data?.sample_rate ?? data?.sampleRate,
                     channels: data?.channels,
@@ -792,16 +817,16 @@ export class WasmEngine {
                 });
             });
         }
-        _a.registerGlobalCallbackListener("startPlaybackJS", () => {
+        on("startPlaybackJS", () => {
             callbacks.onAudioPlaybackStart?.();
             this.#startAudioPlaybackLoop();
         });
-        _a.registerGlobalCallbackListener("stopPlaybackJS", () => {
+        on("stopPlaybackJS", () => {
             this.#stopAudioPlaybackLoop();
             callbacks.onAudioPlaybackStop?.();
         });
         if (callbacks.onSignalingXmpp) {
-            _a.registerGlobalCallbackListener("onSignalingXmpp", (data) => {
+            on("onSignalingXmpp", (data) => {
                 const peerJid = data.peerJid ?? data.args?.peerJid;
                 const callId = data.callId ?? data.args?.callId;
                 let xmlPayload = data.xmlPayload ?? data.args?.xmlPayload;
@@ -815,12 +840,12 @@ export class WasmEngine {
             });
         }
         if (callbacks.onCallEvent) {
-            _a.registerGlobalCallbackListener("onCallEvent", (data) => {
+            on("onCallEvent", (data) => {
                 callbacks.onCallEvent(data.eventType, data.eventDataJson);
             });
         }
         if (callbacks.sendDataToRelay) {
-            _a.registerGlobalCallbackListener("sendDataToRelay", (data) => {
+            on("sendDataToRelay", (data) => {
                 let relayData = data.data ?? data.args?.data;
                 const ip = data.ip ?? data.args?.ip;
                 const portNum = data.port ?? data.args?.port;
@@ -842,7 +867,6 @@ export class WasmEngine {
                 return relayData.byteLength;
             });
         }
-        _a.#globalCallbacksRegistered = true;
     };
     #requireModule = (name) => {
         const preDefinedModules = {

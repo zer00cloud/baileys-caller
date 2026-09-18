@@ -231,6 +231,10 @@ export class WasmEngine {
     set.add(handler);
   };
 
+  static removeGlobalCallbackListener = (callbackName: string, handler: (data: any) => void): void => {
+    WasmEngine.#globalCallbackListeners.get(`callback:${callbackName}`)?.delete(handler);
+  };
+
   static notifyGlobalCallbackListeners = (callbackName: string, data: any): void => {
     const set = WasmEngine.#globalCallbackListeners.get(`callback:${callbackName}`);
     if (!set) return;
@@ -266,6 +270,7 @@ export class WasmEngine {
 
   #workerModulesCode = "";
   #loaderCode = "";
+  #registeredGlobalHandlers: Array<{ name: string; handler: (data: any) => void }> = [];
 
   constructor(config: WasmEngineConfig = {}) {
     const basePath = config.resourcesPath
@@ -351,7 +356,14 @@ export class WasmEngine {
       throw new Error(`No compatible WASM loader found. Tried: ${loaderModuleNames.join(", ")}`);
     }
 
-    if (!WasmEngine.#globalCallbacksRegistered) this.#registerGlobalCallbacks();
+    if (!WasmEngine.#globalCallbacksRegistered) {
+      this.#registerGlobalCallbacks();
+      WasmEngine.#globalCallbacksRegistered = true;
+    } else {
+      // Engine baru (mis. setelah disconnect/connect ulang) tetap harus
+      // mendaftarkan callback-nya sendiri, kalau tidak event WASM hilang.
+      this.#registerGlobalCallbacks();
+    }
     await this.#initPThreadPool();
     const workersLoadingPromise = this.#loadWasmModuleToAllWorkers();
 
@@ -371,6 +383,10 @@ export class WasmEngine {
 
   destroy = (): void => {
     this.#stopAudioPlaybackLoop();
+    for (const { name, handler } of this.#registeredGlobalHandlers) {
+      try { WasmEngine.removeGlobalCallbackListener(name, handler); } catch {}
+    }
+    this.#registeredGlobalHandlers = [];
     if (this.#instance && typeof this.#instance.endCall === "function") {
       try { this.#instance.endCall(0, false); } catch {}
     }
@@ -657,7 +673,10 @@ export class WasmEngine {
   };
 
   #startAudioPlaybackLoop = (): void => {
-    if (this.#audioPlaybackLoopInterval) return;
+    // Panggilan ke-3/4 kadang start tanpa stop yang bersih dari WASM —
+    // loop lama (buffer basi) bikin audio cuma 1 frame lalu diam.
+    // Restart selalu agar buffer fresh tiap panggilan.
+    if (this.#audioPlaybackLoopInterval) this.#stopAudioPlaybackLoop();
     this.#ensureInitialized();
     this.#isPlaybackActive = true;
     if (typeof this.#instance.requestAudioDataFromWasmVoip !== "function") return;
@@ -825,8 +844,12 @@ export class WasmEngine {
 
   #registerGlobalCallbacks = (): void => {
     const callbacks = this.#config.callbacks ?? {};
+    const on = (name: string, handler: (data: any) => void): void => {
+      WasmEngine.registerGlobalCallbackListener(name, handler);
+      this.#registeredGlobalHandlers.push({ name, handler });
+    };
 
-    WasmEngine.registerGlobalCallbackListener("loggingCallback", (data) => {
+    on("loggingCallback", (data) => {
       if (!this.#config.enableLogs) return;
       const level = data?.level;
       const msg = data?.message ?? "";
@@ -835,7 +858,7 @@ export class WasmEngine {
     });
 
     if (callbacks.onAudioCaptureInit) {
-      WasmEngine.registerGlobalCallbackListener("initCaptureDriverJS", (data) => {
+      on("initCaptureDriverJS", (data) => {
         callbacks.onAudioCaptureInit!({
           sampleRate: data?.sample_rate ?? data?.sampleRate,
           channels: data?.channels,
@@ -845,11 +868,11 @@ export class WasmEngine {
       });
     }
 
-    WasmEngine.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
-    WasmEngine.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
+    on("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
+    on("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
 
     if (callbacks.onAudioPlaybackInit) {
-      WasmEngine.registerGlobalCallbackListener("initPlaybackDriverJS", (data) => {
+      on("initPlaybackDriverJS", (data) => {
         callbacks.onAudioPlaybackInit!({
           sampleRate: data?.sample_rate ?? data?.sampleRate,
           channels: data?.channels,
@@ -859,17 +882,17 @@ export class WasmEngine {
       });
     }
 
-    WasmEngine.registerGlobalCallbackListener("startPlaybackJS", () => {
+    on("startPlaybackJS", () => {
       callbacks.onAudioPlaybackStart?.();
       this.#startAudioPlaybackLoop();
     });
-    WasmEngine.registerGlobalCallbackListener("stopPlaybackJS", () => {
+    on("stopPlaybackJS", () => {
       this.#stopAudioPlaybackLoop();
       callbacks.onAudioPlaybackStop?.();
     });
 
     if (callbacks.onSignalingXmpp) {
-      WasmEngine.registerGlobalCallbackListener("onSignalingXmpp", (data) => {
+      on("onSignalingXmpp", (data) => {
         const peerJid = data.peerJid ?? data.args?.peerJid;
         const callId = data.callId ?? data.args?.callId;
         let xmlPayload = data.xmlPayload ?? data.args?.xmlPayload;
@@ -883,13 +906,13 @@ export class WasmEngine {
     }
 
     if (callbacks.onCallEvent) {
-      WasmEngine.registerGlobalCallbackListener("onCallEvent", (data) => {
+      on("onCallEvent", (data) => {
         callbacks.onCallEvent!(data.eventType, data.eventDataJson);
       });
     }
 
     if (callbacks.sendDataToRelay) {
-      WasmEngine.registerGlobalCallbackListener("sendDataToRelay", (data) => {
+      on("sendDataToRelay", (data) => {
         let relayData = data.data ?? data.args?.data;
         const ip = data.ip ?? data.args?.ip;
         const portNum = data.port ?? data.args?.port;
@@ -909,8 +932,6 @@ export class WasmEngine {
         return relayData.byteLength;
       });
     }
-
-    WasmEngine.#globalCallbacksRegistered = true;
   };
 
   #requireModule = (name: string): any => {

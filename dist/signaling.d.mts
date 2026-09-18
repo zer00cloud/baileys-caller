@@ -38,4 +38,6 @@ export declare class SignalingBridge {
     resolveLid: (pnJid: string) => Promise<string | undefined>;
     issueTcToken: (jid: string) => Promise<boolean>;
     getRemoteDeviceJid: (callId: string) => string | undefined;
+    /** Hapus semua routing state untuk satu callId agar panggilan berikutnya bersih. */
+    clearCallState: (callId: string) => void;
 }

@@ -9,25 +9,33 @@ const log = (scope, msg) => {
 
 const client = new VoipClient({ authDir });
 
-client.on("incoming-call", async (call) => {
-  log("CALL", `incoming voice call id=${call.callId} from=${call.from ?? "unknown"}`);
+let callCount = 0;
 
-  call.on("received", () => log("STATE", "WASM entered ReceivedCall"));
-  call.on("answering", () => log("STATE", "answer sent / AcceptSent"));
-  call.on("connected", () => log("STATE", "connected / Active"));
-  call.on("audio", (pcm) => log("AUDIO", `incoming PCM frame samples=${pcm.length}`));
-  call.on("ended", (reason) => log("CALL", `ended reason=${reason}`));
-  call.on("error", (err) => log("ERROR", err.message));
+client.on("incoming-call", async (call) => {
+  callCount += 1;
+  const n = callCount;
+  log("CALL", `#${n} incoming voice call id=${call.callId} from=${call.from ?? "unknown"}`);
+
+  call.on("received", () => log("STATE", `#${n} WASM entered ReceivedCall`));
+  call.on("ringing", () => log("STATE", `#${n} ringing / PreacceptReceived`));
+  call.on("answering", () => log("STATE", `#${n} answer sent / AcceptSent`));
+  call.on("connected", () => log("STATE", `#${n} connected / Active`));
+  call.on("audio", (pcm) => log("AUDIO", `#${n} incoming PCM frame samples=${pcm.length}`));
+  call.on("ended", (reason) => log("CALL", `#${n} ended reason=${reason}; ready for next call`));
+  call.on("error", (err) => log("ERROR", `#${n} ${err.message}`));
 
   try {
-    log("CALL", "answering");
+    log("CALL", `#${n} answering like first call`);
     await call.answer();
     await call.waitForConnected();
-    log("AUDIO", `playback starting source=${audioSource}`);
+    log("AUDIO", `#${n} playback starting source=${audioSource}`);
     await call.play(audioSource);
+    await call.waitForEnd();
   } catch (err) {
-    log("ERROR", err instanceof Error ? err.message : String(err));
-    call.end();
+    log("ERROR", `#${n} ${err instanceof Error ? err.message : String(err)}`);
+    try { call.end(); } catch {}
+  } finally {
+    log("CALL", `#${n} done; waiting for next inbound call`);
   }
 });
 

@@ -303,8 +303,53 @@ export class RelayRtcTransport {
 
     this.#relayInfoById.clear();
     for (const [id, info] of nextInfoById) {
+      const prev = this.#connections.get(id);
+      // Kredensial relay (key/token) berganti tiap panggilan. Koneksi lama
+      // yang masih open memakai ufrag/pwd lama dan akan stall (1 frame lalu
+      // diam) — paksa bangun ulang agar DTLS pakai kredensial baru.
+      if (prev && prev.info.name !== "early-packet" &&
+          (prev.info.key !== info.key || prev.info.token !== info.token ||
+           prev.info.authToken !== info.authToken)) {
+        this.#closeConnection(id);
+      }
       this.#relayInfoById.set(id, info);
+      // Pindahkan buffer paket early (sebelum relay list datang) ke koneksi
+      // resmi agar tidak hilang pada panggilan ke-2,3,4...
+      this.#adoptEarlyBuffers(info);
       void this.#ensureConnection(info);
+    }
+  };
+
+  /**
+   * Reset flag media antar panggilan. Dipanggil saat panggilan baru masuk
+   * (offer) dan saat panggilan berakhir — tanpa menutup koneksi yang sudah
+   * open (tetap cepat), tapi cegah ICE-restart palsu dari state panggilan lama.
+   */
+  noteCallStarted = (): void => {
+    const now = Date.now();
+    for (const connection of this.#connections.values()) {
+      if (connection.info.name === "early-packet") continue;
+      connection.sentMedia = false;
+      connection.hasNonStunPacketSent = false;
+      connection.hasReceivedFirstPacket = false;
+      connection.lastRxPacketTime = now;
+      connection.isReconnecting = false;
+    }
+  };
+
+  noteCallEnded = (): void => {
+    // Buang koneksi placeholder early-packet (token kosong) agar tidak
+    // menumpuk setelah 3-4 panggilan; koneksi resmi tetap open untuk reuse.
+    for (const [id, connection] of [...this.#connections]) {
+      if (connection.info.name === "early-packet") {
+        connection.packetBuffer = [];
+        connection.bufferedBytes = 0;
+        this.#connections.delete(id);
+      } else {
+        connection.packetBuffer = [];
+        connection.bufferedBytes = 0;
+        connection.isReconnecting = false;
+      }
     }
   };
 
@@ -371,6 +416,18 @@ export class RelayRtcTransport {
 
   // ─── private ──────────────────────────────────────────────────────────────
 
+  #adoptEarlyBuffers = (info: RelayConnectionInfo): void => {
+    const target = this.#getOrCreateConnection(info);
+    for (const [id, connection] of [...this.#connections]) {
+      if (id === info.id) continue;
+      if (connection.info.name !== "early-packet" || connection.info.ip !== info.ip) continue;
+      for (const packet of connection.packetBuffer) {
+        bufferPacket(target, packet);
+      }
+      this.#connections.delete(id);
+    }
+  };
+
   #getOrCreateConnection = (info: RelayConnectionInfo): RelayConnectionRuntime => {
     const existing = this.#connections.get(info.id);
     if (existing) {
@@ -415,8 +472,7 @@ export class RelayRtcTransport {
     const connection = this.#getOrCreateConnection(info);
     if (connection.state === "open" || connection.state === "connecting") {
       return connection.connectPromise ?? Promise.resolve();
-    }
-    const promise = this.#connect(connection);
+    }    const promise = this.#connect(connection);
     connection.connectPromise = promise;
     try { await promise; } finally { connection.connectPromise = null; }
   };

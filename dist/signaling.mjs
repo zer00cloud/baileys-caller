@@ -185,6 +185,15 @@ export class SignalingBridge {
         }
     };
     getRemoteDeviceJid = (callId) => this.#remoteDevicePeerByCallId.get(callId);
+    /** Hapus semua routing state untuk satu callId agar panggilan berikutnya bersih. */
+    clearCallState = (callId) => {
+        if (!callId)
+            return;
+        this.#remoteDevicePeerByCallId.delete(callId);
+        this.#remoteObfuscatedPeerByCallId.delete(callId);
+        this.#remoteXmppRoutePeerByCallId.delete(callId);
+        this.#incomingCallPeerById.delete(callId);
+    };
     // ─── private — outbound signaling ─────────────────────────────────────────
     #doSendSignaling = async (peerJid, callId, xmlPayload) => {
         const { decodeBinaryNode, getBinaryNodeChild } = this.#baileys;
@@ -441,24 +450,46 @@ export class SignalingBridge {
         if (type !== "pkmsg" && type !== "msg")
             return voipNode;
         const candidates = [...new Set([peerJid, this.#toCallDeviceJid(peerJid)])].filter(Boolean);
-        let lastErr;
-        for (const jid of candidates) {
-            try {
-                const decrypted = await this.#sock.signalRepository.decryptMessage({
-                    jid, type, ciphertext: enc.content,
-                });
-                const parsed = proto.Message.decode(unpadRandomMax16(decrypted));
-                const callKey = parsed.call?.callKey;
-                if (!callKey || callKey.length === 0) {
-                    throw new Error("decrypted signaling has no call.callKey");
+        const tryCandidates = async () => {
+            for (const jid of candidates) {
+                try {
+                    const decrypted = await this.#sock.signalRepository.decryptMessage({
+                        jid, type, ciphertext: enc.content,
+                    });
+                    const parsed = proto.Message.decode(unpadRandomMax16(decrypted));
+                    const callKey = parsed.call?.callKey;
+                    if (!callKey || callKey.length === 0) {
+                        throw new Error("decrypted signaling has no call.callKey");
+                    }
+                    enc.content = callKey;
+                    return true;
                 }
-                enc.content = callKey;
-                return voipNode;
+                catch (err) {
+                    lastErr = err;
+                }
             }
-            catch (err) {
-                lastErr = err;
-            }
+            return false;
+        };
+        let lastErr;
+        if (await tryCandidates())
+            return voipNode;
+        // Sesi signal bisa basi setelah beberapa panggilan ("closed session").
+        // Paksa refresh sesi lalu coba sekali lagi sebelum menyerah.
+        debugCall("SIGNAL", "decrypt failed, refreshing sessions and retrying", {
+            peerJid,
+            error: lastErr instanceof Error ? lastErr.message : String(lastErr),
+        });
+        try {
+            this.#invalidateSignalSessions(candidates);
+            await this.#ensureSignalSessions(candidates, true);
         }
+        catch { }
+        if (await tryCandidates())
+            return voipNode;
+        debugCall("SIGNAL", "decrypt failed after retry", {
+            peerJid,
+            error: lastErr instanceof Error ? lastErr.message : String(lastErr),
+        });
         throw lastErr;
     };
     #encryptCallKey = async (targetJid, rawCallKey, count) => {
@@ -468,18 +499,50 @@ export class SignalingBridge {
             ? [primaryDeviceJid, targetJid]
             : [targetJid];
         await this.#ensureSignalSessions(sessionTargets, false);
-        const { type, ciphertext } = await this.#sock.signalRepository.encryptMessage({
-            jid: targetJid,
-            data: encodeWAMessage({ call: { callKey: Buffer.from(rawCallKey) } }),
-        });
-        return {
-            encNode: {
-                tag: "enc",
-                attrs: { v: "2", type, count: String(count) },
-                content: Buffer.from(ciphertext),
-            },
-            shouldIncludeDeviceIdentity: type === "pkmsg",
-        };
+        try {
+            const { type, ciphertext } = await this.#sock.signalRepository.encryptMessage({
+                jid: targetJid,
+                data: encodeWAMessage({ call: { callKey: Buffer.from(rawCallKey) } }),
+            });
+            return {
+                encNode: {
+                    tag: "enc",
+                    attrs: { v: "2", type, count: String(count) },
+                    content: Buffer.from(ciphertext),
+                },
+                shouldIncludeDeviceIdentity: type === "pkmsg",
+            };
+        }
+        catch (err) {
+            // Sesi bisa tertutup di sisi lawan setelah beberapa panggilan — refresh lalu retry sekali.
+            debugCall("SIGNAL", "encrypt failed, refreshing sessions and retrying", {
+                targetJid,
+                error: err instanceof Error ? err.message : String(err),
+            });
+            this.#invalidateSignalSessions(sessionTargets);
+            await this.#ensureSignalSessions(sessionTargets, true);
+            const { type, ciphertext } = await this.#sock.signalRepository.encryptMessage({
+                jid: targetJid,
+                data: encodeWAMessage({ call: { callKey: Buffer.from(rawCallKey) } }),
+            });
+            return {
+                encNode: {
+                    tag: "enc",
+                    attrs: { v: "2", type, count: String(count) },
+                    content: Buffer.from(ciphertext),
+                },
+                shouldIncludeDeviceIdentity: type === "pkmsg",
+            };
+        }
+    };
+    #invalidateSignalSessions = (jids) => {
+        for (const jid of jids.filter(Boolean)) {
+            try {
+                const signalId = this.#sock.signalRepository.jidToSignalProtocolAddress(jid);
+                this.#ensuredSignalSessions.delete(signalId);
+            }
+            catch { }
+        }
     };
     #ensureSignalSessions = async (jids, refresh) => {
         const { parseAndInjectE2ESessions } = this.#baileys;

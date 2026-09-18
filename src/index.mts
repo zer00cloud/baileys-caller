@@ -127,6 +127,7 @@ export class ActiveCall extends EventEmitter {
   readonly #connectedPromise: Promise<void>;
   #endTimer: NodeJS.Timeout | null = null;
   #ended = false;
+  #endEmitted = false;
 
   /** @internal mirrors the source path for the audio feeder */
   _audioSource: string = "silence";
@@ -149,11 +150,15 @@ export class ActiveCall extends EventEmitter {
 
   get state(): CallState { return this.#state; }
 
-  end = (): void => {
+  end = (reason = "ended"): void => {
     if (this.#ended) return;
     this.#ended = true;
     if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
     try { this.engine.endCall(0, true); } catch {}
+    // Jangan tunggu state Idle/Ending dari WASM saja — WASM kadang tidak
+    // mengirim state terminal setelah end() lokal, sehingga panggilan
+    // berikutnya tertahan. Paksa emit ended agar client bisa reset.
+    this._forceEnd(reason);
   };
 
   mute = (muted: boolean): void => {
@@ -216,7 +221,8 @@ export class ActiveCall extends EventEmitter {
 
   /** @internal */
   _forceEnd = (reason: string): void => {
-    if (this.#ended) return;
+    if (this.#endEmitted) return;
+    this.#endEmitted = true;
     this.#ended = true;
     if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
     this.emit("ended", reason);
@@ -411,6 +417,7 @@ export class VoipClient extends EventEmitter {
     this.#wireActiveCall(call);
     call._audioSource = audioSource;
     this.#activeCall = call;
+    try { this.#relay?.noteCallStarted(); } catch {}
 
     this.#engine.startCall({
       peerJid: peerLid,
@@ -428,8 +435,13 @@ export class VoipClient extends EventEmitter {
 
   /** Tear down the WhatsApp socket and release resources. */
   disconnect = (): void => {
-    this.#activeCall?._forceEnd("disconnect");
+    try { this.#activeCall?._forceEnd("disconnect"); } catch {}
     this.#activeCall = null;
+    this.#resetCallMedia();
+    if (this.#engine && this.#capturePtr) {
+      try { this.#engine.free(this.#capturePtr); } catch {}
+      this.#capturePtr = 0;
+    }
     this.#relay?.closeAll();
     this.#engine?.destroy();
     this.#sock?.end?.();
@@ -446,12 +458,27 @@ export class VoipClient extends EventEmitter {
 
     const offer = extractIncomingOffer(node);
     let callToEmit: ActiveCall | null = null;
-    if (offer && !this.#activeCall) {
-      const call = new ActiveCall(offer.callId, this.#engine, 120_000, "inbound", offer.from);
-      call._audioSource = "silence";
-      this.#wireActiveCall(call);
-      this.#activeCall = call;
-      callToEmit = call;
+    if (offer) {
+      // Jika panggilan lama sudah selesai (Idle/Ending) tapi objeknya belum
+      // dibersihkan karena race, paksa tutup agar panggilan baru bisa masuk.
+      const stale = this.#activeCall;
+      if (stale && stale.callId !== offer.callId &&
+          (stale.state === CallState.Idle || stale.state === CallState.Ending)) {
+        try { stale._forceEnd("ended"); } catch {}
+        this.#resetCallMedia();
+        this.#signaling.clearCallState(stale.callId);
+        this.#activeCall = null;
+      }
+      if (!this.#activeCall) {
+        const call = new ActiveCall(offer.callId, this.#engine, 120_000, "inbound", offer.from);
+        call._audioSource = "silence";
+        this.#wireActiveCall(call);
+        this.#activeCall = call;
+        callToEmit = call;
+        // Reset flag media relay untuk panggilan baru (cegah ICE-restart
+        // palsu / stall setelah 3-4 panggilan beruntun).
+        try { this.#relay?.noteCallStarted(); } catch {}
+      }
     }
 
     await this.#signaling.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
@@ -459,6 +486,13 @@ export class VoipClient extends EventEmitter {
     if (callToEmit) {
       this.emit("incoming-call", callToEmit);
     }
+  };
+
+  #resetCallMedia = (): void => {
+    try { this.#feeder?.stop(); } catch {}
+    this.#feeder = null;
+    // Jangan free capturePtr di sini — itu tugas onAudioCaptureStop dari WASM.
+    // Tapi pastikan feeder berhenti agar panggilan berikutnya mulai bersih.
   };
 
   #wireActiveCall = (call: ActiveCall): void => {
@@ -482,7 +516,13 @@ export class VoipClient extends EventEmitter {
       this.#feeder.start();
     });
     call.once("ended", () => {
-      if (this.#activeCall === call) this.#activeCall = null;
+      if (this.#activeCall === call) {
+        this.#resetCallMedia();
+        try { this.#relay?.noteCallEnded(); } catch {}
+        try { this.#signaling?.clearCallState(call.callId); } catch {}
+        this.#activeCall = null;
+        debugCall("CALL", "active call cleared, ready for next call", { callId: call.callId });
+      }
     });
   };
 
@@ -518,11 +558,31 @@ export class VoipClient extends EventEmitter {
     this.#captureFramesPerChunk = config.framesPerChunk || 320;
     const chunkSamples = this.#captureFramesPerChunk * this.#captureChannels;
     this.#captureChunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
+    // Panggilan kedua bisa memicu init ulang tanpa stop yang bersih —
+    // bebaskan buffer lama dulu agar tidak bocor / double-alloc.
+    if (this.#capturePtr) {
+      try { this.#engine.free(this.#capturePtr); } catch {}
+      this.#capturePtr = 0;
+    }
     this.#capturePtr = this.#engine.malloc(this.#captureChunkBytes);
   };
 
   #handleAudioCaptureStart = (): void => {
-    if (!this.#engine || !this.#capturePtr) return;
+    if (!this.#engine) return;
+    // Panggilan kedua kadang start tanpa init baru (ptr sudah di-free
+    // oleh stop sebelumnya). Alokasikan ulang agar feeder tetap jalan.
+    if (!this.#capturePtr) {
+      const chunkSamples = this.#captureFramesPerChunk * this.#captureChannels;
+      this.#captureChunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
+      this.#capturePtr = this.#engine.malloc(this.#captureChunkBytes);
+      debugCall("AUDIO", "capture buffer re-allocated on start", {
+        bytes: this.#captureChunkBytes,
+      });
+    }
+    if (!this.#capturePtr) return;
+    // Hentikan feeder sisa panggilan sebelumnya agar tidak dobel.
+    try { this.#feeder?.stop(); } catch {}
+    this.#feeder = null;
     const audioSource = this.#activeCall?._audioSource ?? "silence";
     debugCall("AUDIO", "capture start", {
       audioSource,

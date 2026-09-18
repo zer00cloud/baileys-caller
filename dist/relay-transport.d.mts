@@ -36,6 +36,13 @@ export declare class RelayRtcTransport {
     private readonly config;
     constructor(config: RelayTransportConfig);
     updateRelayList: (update: RelayListUpdatePayload) => void;
+    /**
+     * Reset flag media antar panggilan. Dipanggil saat panggilan baru masuk
+     * (offer) dan saat panggilan berakhir — tanpa menutup koneksi yang sudah
+     * open (tetap cepat), tapi cegah ICE-restart palsu dari state panggilan lama.
+     */
+    noteCallStarted: () => void;
+    noteCallEnded: () => void;
     send: (packet: Uint8Array | Buffer, ip: string, port: number) => number;
     getStats: () => RelayTransportStats;
     closeAll: () => Promise<void>;

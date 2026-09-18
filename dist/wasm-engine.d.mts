@@ -40,6 +40,7 @@ export type WasmEngineConfig = {
 export declare class WasmEngine {
     #private;
     static registerGlobalCallbackListener: (callbackName: string, handler: (data: any) => void) => void;
+    static removeGlobalCallbackListener: (callbackName: string, handler: (data: any) => void) => void;
     static notifyGlobalCallbackListeners: (callbackName: string, data: any) => void;
     constructor(config?: WasmEngineConfig);
     initialize: () => Promise<void>;
