@@ -21,8 +21,11 @@ export type CallOptions = {
 };
 /** Events emitted by an `ActiveCall`. */
 export type CallEvents = {
+    received: () => void;
+    answering: () => void;
     ringing: () => void;
     connected: () => void;
+    playSource: (audioSource: string) => void;
     /** 16 kHz mono Float32 PCM frame from the remote peer. */
     audio: (pcm: Float32Array) => void;
     /** Reason: `"hangup"` | `"timeout"` | `"rejected"` | `"remote_end"` | `"disconnect"` | etc. */

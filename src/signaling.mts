@@ -29,6 +29,13 @@ const S_WHATSAPP_NET = "@s.whatsapp.net";
 const TC_TOKEN_REQUEST_TIMEOUT_MS = 3500;
 const SESSION_CACHE_TTL_MS = 5 * 60_000;
 const ACK_TIMEOUT_MS = 15_000;
+const DEBUG_CALL_LOGS = process.env.DEBUG_CALL_LOGS === "1";
+
+const debugCall = (scope: string, message: string, data?: unknown): void => {
+  if (!DEBUG_CALL_LOGS) return;
+  const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
+  console.log(`${new Date().toTimeString().slice(0, 8)} [${scope}] ${message}${suffix}`);
+};
 
 let _baileysModule: any = null;
 
@@ -115,16 +122,18 @@ export class SignalingBridge {
       .catch(() => {});
   };
 
-  processIncomingCall = (node: any, voip: any, activeCallId: string): void => {
+  processIncomingCall = (node: any, voip: any, activeCallId: string): Promise<void> => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingCall(node, voip, activeCallId))
       .catch(() => {});
+    return this.#incomingSignalingQueue;
   };
 
-  processIncomingReceipt = (node: any, voip: any, activeCallId: string): void => {
+  processIncomingReceipt = (node: any, voip: any, activeCallId: string): Promise<void> => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingReceipt(node, voip, activeCallId))
       .catch(() => {});
+    return this.#incomingSignalingQueue;
   };
 
   requestTcToken = async (jid: string): Promise<Uint8Array | undefined> => {
@@ -232,6 +241,7 @@ export class SignalingBridge {
 
     const signalingTag = String(voipNode.tag);
     const effectivePeerJid = this.#resolveOutboundPeerJid(callId, peerJid);
+    debugCall("SIGNAL", "outbound from WASM", { tag: signalingTag, callId, peerJid, effectivePeerJid });
 
     if (signalingTag === "offer" && !voipNode.attrs["call-creator"]) {
       const selfLid = this.#sock.authState.creds.me?.lid;
@@ -304,6 +314,14 @@ export class SignalingBridge {
     callbackPeerJid: string,
   ): Promise<void> => {
     const stanzaId = this.#sock.generateMessageTag();
+    debugCall("SIGNAL", "send call stanza", {
+      stanzaId,
+      tag: signalingTag,
+      routeTo,
+      effectivePeerJid,
+      callbackPeerJid,
+      attrs: voipNode.attrs,
+    });
     await this.#sock.sendNode({
       tag: "call",
       attrs: { to: routeTo, id: stanzaId },
@@ -317,6 +335,11 @@ export class SignalingBridge {
         const { encodeBinaryNode } = this.#baileys;
         const ackPayload = Buffer.from(encodeBinaryNode(ackNode)).toString("base64");
         const tcToken = await this.ensureTcToken(effectivePeerJid, callbackPeerJid);
+        debugCall("SIGNAL", "server ack", {
+          stanzaId,
+          tag: signalingTag,
+          ackAttrs: ackNode.attrs,
+        });
         try {
           this.#voip.handleSignalingAck({
             payload: ackPayload,
@@ -337,6 +360,12 @@ export class SignalingBridge {
 
     const voipChild = getAllBinaryNodeChildren(node)[0];
     if (!voipChild) return;
+    debugCall("SIGNAL", "incoming call node", {
+      rootAttrs: node.attrs,
+      childTag: voipChild.tag,
+      childAttrs: voipChild.attrs,
+      activeCallId,
+    });
 
     const incomingCallId = String(voipChild.attrs["call-id"] ?? voipChild.attrs.call_id ?? "");
     const callIdForRouting = incomingCallId || activeCallId;
@@ -385,6 +414,14 @@ export class SignalingBridge {
 
     switch (usableNode.tag) {
       case "offer":
+        debugCall("SIGNAL", "handle offer", {
+          callId: callIdForRouting,
+          routedPeerJid,
+          senderDeviceJid,
+          callbackPeerJid,
+          platform,
+          appVersion,
+        });
         voip.handleSignalingOffer({
           payload: b64,
           peerPlatform: Number(platform || 0),
@@ -397,6 +434,11 @@ export class SignalingBridge {
         });
         break;
       case "ack":
+        debugCall("SIGNAL", "handle ack", {
+          callId: callIdForRouting,
+          routedPeerJid,
+          attrs: usableNode.attrs,
+        });
         voip.handleSignalingAck({
           payload: b64,
           ackError: usableNode.attrs.error ?? "0",
@@ -406,6 +448,12 @@ export class SignalingBridge {
         });
         break;
       default:
+        debugCall("SIGNAL", "handle message", {
+          callId: callIdForRouting,
+          tag: usableNode.tag,
+          routedPeerJid,
+          attrs: usableNode.attrs,
+        });
         voip.handleSignalingMessage({
           payload: b64,
           peerPlatform: platform,

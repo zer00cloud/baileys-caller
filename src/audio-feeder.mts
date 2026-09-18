@@ -7,10 +7,15 @@
  * @author ShellTear
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const ffmpegStaticPath = require("ffmpeg-static") as string | null;
 
 const LOW_WATERMARK_CHUNKS = 16;
 const MAX_QUEUED_CHUNKS = 1024;
 const DEFAULT_WARMUP_MS = 500;
+const DEBUG_CALL_LOGS = process.env.DEBUG_CALL_LOGS === "1";
 
 export class AudioFeeder {
   #proc: ChildProcessWithoutNullStreams | null = null;
@@ -24,6 +29,7 @@ export class AudioFeeder {
   underflowChunks = 0;
   bytesProduced = 0;
   chunksEmitted = 0;
+  #lastDebugAtMs = 0;
 
   constructor(
     private readonly sampleRate: number,
@@ -41,8 +47,9 @@ export class AudioFeeder {
     const chunkIntervalMs = (this.framesPerChunk / this.sampleRate) * 1000;
 
     const inputArgs = this.#resolveInputArgs();
+    const ffmpegPath = process.env.FFMPEG_PATH || ffmpegStaticPath || "ffmpeg";
 
-    this.#proc = spawn("ffmpeg", [
+    const proc = spawn(ffmpegPath, [
       "-hide_banner",
       "-loglevel", "error",
       "-thread_queue_size", "512",
@@ -52,12 +59,13 @@ export class AudioFeeder {
       "-ar", String(this.sampleRate),
       "pipe:1",
     ]);
+    this.#proc = proc;
 
-    this.#proc.stdout.on("data", (chunk: Buffer) => {
+    proc.stdout.on("data", (chunk: Buffer) => {
       this.#pending = Buffer.concat([this.#pending, chunk]);
       while (this.#pending.length >= chunkBytes) {
         if (this.#queue.length >= MAX_QUEUED_CHUNKS) {
-          this.#proc?.stdout.pause();
+          proc.stdout.pause();
           break;
         }
         const frame = this.#pending.subarray(0, chunkBytes);
@@ -69,11 +77,11 @@ export class AudioFeeder {
       }
     });
 
-    this.#proc.stderr.on("data", (chunk: Buffer) => {
+    proc.stderr.on("data", (chunk: Buffer) => {
       process.stderr.write(`[AudioFeeder] ${chunk.toString().trim()}\n`);
     });
 
-    this.#proc.on("exit", (code) => {
+    proc.on("exit", (code) => {
       if (code !== 0 && code !== null) {
         process.stderr.write(`[AudioFeeder] ffmpeg exited with code=${code}\n`);
       }
@@ -104,7 +112,7 @@ export class AudioFeeder {
     if (this.source.startsWith("lavfi:")) {
       return ["-f", "lavfi", "-i", this.source.slice("lavfi:".length)];
     }
-    return ["-i", this.source];
+    return ["-stream_loop", "-1", "-i", this.source];
   };
 
   #scheduleNext = (chunkSamples: number, chunkIntervalMs: number): void => {
@@ -134,6 +142,13 @@ export class AudioFeeder {
     }
     this.chunksEmitted += 1;
     this.onChunk(nextChunk);
+    if (DEBUG_CALL_LOGS && Date.now() - this.#lastDebugAtMs > 1000) {
+      this.#lastDebugAtMs = Date.now();
+      const peak = nextChunk.reduce((max, sample) => Math.max(max, Math.abs(sample)), 0);
+      process.stderr.write(
+        `[AudioFeeder] emitted=${this.chunksEmitted} queued=${this.#queue.length} peak=${peak.toFixed(4)} underflow=${this.underflowChunks}\n`,
+      );
+    }
     if (this.#proc?.stdout.isPaused() && this.#queue.length <= MAX_QUEUED_CHUNKS / 4) {
       this.#proc.stdout.resume();
     }

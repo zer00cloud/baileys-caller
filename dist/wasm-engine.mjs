@@ -441,6 +441,20 @@ export class WasmEngine {
         this.#ensureInitialized();
         return this.#instance.setCallMute(muted);
     };
+    acceptCall = (isMicEnabled = true, isCameraEnabled = false) => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.acceptCall !== "function") {
+            throw new Error("WASM VoIP engine does not expose acceptCall()");
+        }
+        return this.#instance.acceptCall(isMicEnabled, isCameraEnabled);
+    };
+    rejectCall = () => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.rejectCall !== "function") {
+            throw new Error("WASM VoIP engine does not expose rejectCall()");
+        }
+        return this.#instance.rejectCall();
+    };
     updateNetworkMedium = (networkMedium, networkMtu = 0) => {
         this.#ensureInitialized();
         this.#instance.updateNetworkMedium?.(networkMedium, networkMtu);

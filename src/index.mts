@@ -24,6 +24,13 @@ export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./type
 export { CallState } from "./types.mjs";
 
 const SHA256_LEN = 32;
+const DEBUG_CALL_LOGS = process.env.DEBUG_CALL_LOGS === "1";
+
+const debugCall = (scope: string, message: string, data?: unknown): void => {
+  if (!DEBUG_CALL_LOGS) return;
+  const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
+  console.log(`${new Date().toTimeString().slice(0, 8)} [${scope}] ${message}${suffix}`);
+};
 
 const loadBaileys = async (): Promise<any> => {
   try {
@@ -76,11 +83,48 @@ const isCallReceiptNode = (node: any): boolean => {
   return !!(child?.attrs?.["call-id"] || child?.attrs?.call_id);
 };
 
+const getNodeChildren = (node: any): any[] =>
+  Array.isArray(node?.content) ? node.content : [];
+
+const getFirstNodeChild = (node: any): any | undefined =>
+  getNodeChildren(node).find((child) => child?.tag);
+
+const extractIncomingOffer = (node: any): {
+  callId: string;
+  from: string;
+  chatId: string;
+  isVideo: boolean;
+} | undefined => {
+  if (node?.tag !== "call") return undefined;
+  const child = getFirstNodeChild(node);
+  if (child?.tag !== "offer") return undefined;
+  const callId = String(child.attrs?.["call-id"] ?? child.attrs?.call_id ?? "");
+  const from = String(
+    child.attrs?.from ??
+    child.attrs?.["call-creator"] ??
+    child.attrs?.participant ??
+    node.attrs?.participant ??
+    node.attrs?.from ??
+    "",
+  );
+  if (!callId || !from) return undefined;
+  return {
+    callId,
+    from,
+    chatId: String(node.attrs?.from ?? from),
+    isVideo: getNodeChildren(child).some((nested) => nested?.tag === "video"),
+  };
+};
+
 /** A live or recently-ended call. */
 export class ActiveCall extends EventEmitter {
   #state: CallState = CallState.Idle;
   #endResolver!: (reason: string) => void;
+  #receivedResolver!: () => void;
+  #connectedResolver!: () => void;
   readonly #endPromise: Promise<string>;
+  readonly #receivedPromise: Promise<void>;
+  readonly #connectedPromise: Promise<void>;
   #endTimer: NodeJS.Timeout | null = null;
   #ended = false;
 
@@ -91,9 +135,13 @@ export class ActiveCall extends EventEmitter {
     public readonly callId: string,
     private readonly engine: WasmEngine,
     durationMs: number,
+    public readonly direction: "outbound" | "inbound" = "outbound",
+    public readonly from?: string,
   ) {
     super();
     this.#endPromise = new Promise((res) => { this.#endResolver = res; });
+    this.#receivedPromise = new Promise((res) => { this.#receivedResolver = res; });
+    this.#connectedPromise = new Promise((res) => { this.#connectedResolver = res; });
     if (durationMs > 0) {
       this.#endTimer = setTimeout(() => this.end(), durationMs);
     }
@@ -112,13 +160,52 @@ export class ActiveCall extends EventEmitter {
     try { this.engine.setMute(muted); } catch {}
   };
 
+  answer = async (opts: { mic?: boolean; camera?: boolean } = {}): Promise<void> => {
+    if (this.direction !== "inbound") {
+      throw new Error("answer() is only valid for inbound calls");
+    }
+    if (this.#state !== CallState.ReceivedCall) {
+      await Promise.race([
+        this.#receivedPromise,
+        this.#endPromise.then((reason) => {
+          throw new Error(`Call ended before it could be answered: ${reason}`);
+        }),
+      ]);
+    }
+    const result = this.engine.acceptCall(opts.mic ?? true, opts.camera ?? false);
+    debugCall("WASM", "acceptCall returned", { result });
+  };
+
+  play = async (audioSource: string): Promise<void> => {
+    this._audioSource = audioSource;
+    this.emit("playSource", audioSource);
+  };
+
+  waitForConnected = (): Promise<void> => {
+    if (this.#state === CallState.Active) return Promise.resolve();
+    return Promise.race([
+      this.#connectedPromise,
+      this.#endPromise.then((reason) => {
+        throw new Error(`Call ended before connecting: ${reason}`);
+      }),
+    ]);
+  };
+
   waitForEnd = (): Promise<string> => this.#endPromise;
 
   /** @internal — called by VoipClient on WASM call-state change */
   _updateState = (state: number): void => {
     this.#state = state as CallState;
     if (state === CallState.PreacceptReceived) this.emit("ringing");
-    else if (state === CallState.Active) this.emit("connected");
+    else if (state === CallState.ReceivedCall) {
+      this.emit("received");
+      this.#receivedResolver();
+    }
+    else if (state === CallState.AcceptSent) this.emit("answering");
+    else if (state === CallState.Active) {
+      this.emit("connected");
+      this.#connectedResolver();
+    }
     else if (state === CallState.Idle || state === CallState.Ending) {
       this._forceEnd("ended");
     }
@@ -138,7 +225,7 @@ export class ActiveCall extends EventEmitter {
 }
 
 /** Top-level client. Connects to WhatsApp and lets you place calls. */
-export class VoipClient {
+export class VoipClient extends EventEmitter {
   readonly #config: VoipSdkConfig;
   #engine: WasmEngine | null = null;
   #relay: RelayRtcTransport | null = null;
@@ -156,6 +243,7 @@ export class VoipClient {
   #feeder: AudioFeeder | null = null;
 
   constructor(config: VoipSdkConfig) {
+    super();
     this.#config = config;
   }
 
@@ -180,10 +268,17 @@ export class VoipClient {
       fatal: () => {},
     };
 
+    let waVersion: any = undefined;
+    try {
+      const latest = await this.#baileys.fetchLatestWaWebVersion?.();
+      if (latest?.version) waVersion = latest.version;
+    } catch {}
+
     const createSocket = () => makeSocket({
       auth: state,
       emitOwnEvents: true,
       logger: silentLogger,
+      ...(waVersion ? { version: waVersion } : {}),
     });
 
     // Connect with auto-reconnect on the post-QR 515 stream-error path.
@@ -272,11 +367,11 @@ export class VoipClient {
     try { this.#engine.updateNetworkMedium(2, 0); } catch {}
 
     this.#sock.ws.on("CB:call", (node: any) => {
-      this.#signaling!.processIncomingCall(node, this.#engine!, this.#activeCall?.callId ?? "");
+      void this.#handleIncomingCallNode(node);
     });
     this.#sock.ws.on("CB:receipt", (node: any) => {
       if (!isCallReceiptNode(node)) return;
-      this.#signaling!.processIncomingReceipt(node, this.#engine!, this.#activeCall?.callId ?? "");
+      void this.#signaling!.processIncomingReceipt(node, this.#engine!, this.#activeCall?.callId ?? "");
     });
   };
 
@@ -312,7 +407,8 @@ export class VoipClient {
 
     const callId = ("00" + randomBytes(16).toString("hex").slice(2)).toUpperCase();
 
-    const call = new ActiveCall(callId, this.#engine, durationMs);
+    const call = new ActiveCall(callId, this.#engine, durationMs, "outbound");
+    this.#wireActiveCall(call);
     call._audioSource = audioSource;
     this.#activeCall = call;
 
@@ -345,12 +441,61 @@ export class VoipClient {
 
   // ─── private ──────────────────────────────────────────────────────────────
 
+  #handleIncomingCallNode = async (node: any): Promise<void> => {
+    if (!this.#engine || !this.#signaling) return;
+
+    const offer = extractIncomingOffer(node);
+    let callToEmit: ActiveCall | null = null;
+    if (offer && !this.#activeCall) {
+      const call = new ActiveCall(offer.callId, this.#engine, 120_000, "inbound", offer.from);
+      call._audioSource = "silence";
+      this.#wireActiveCall(call);
+      this.#activeCall = call;
+      callToEmit = call;
+    }
+
+    await this.#signaling.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
+
+    if (callToEmit) {
+      this.emit("incoming-call", callToEmit);
+    }
+  };
+
+  #wireActiveCall = (call: ActiveCall): void => {
+    call.on("playSource", (audioSource: string) => {
+      if (this.#activeCall !== call) return;
+      if (!this.#engine) return;
+      this.#feeder?.stop();
+      if (!this.#capturePtr) {
+        const chunkSamples = this.#captureFramesPerChunk * this.#captureChannels;
+        this.#captureChunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
+        this.#capturePtr = this.#engine.malloc(this.#captureChunkBytes);
+        debugCall("AUDIO", "manual capture buffer allocated", {
+          bytes: this.#captureChunkBytes,
+          sampleRate: this.#captureSampleRate,
+          channels: this.#captureChannels,
+          framesPerChunk: this.#captureFramesPerChunk,
+        });
+      }
+      if (!this.#capturePtr) return;
+      this.#feeder = this.#createAudioFeeder(audioSource);
+      this.#feeder.start();
+    });
+    call.once("ended", () => {
+      if (this.#activeCall === call) this.#activeCall = null;
+    });
+  };
+
   #handleCallEvent = (eventType: number, eventData?: string): void => {
+    if (eventType !== 100 && eventType !== 92) {
+      debugCall("WASM", "call event", { eventType, eventData });
+    }
     if (eventType === 16 && eventData) {
       try {
         const parsed = JSON.parse(eventData);
         const info = parsed.call_info ?? parsed.callInfo ?? {};
         const callState = Number(info.call_state ?? info.callState ?? 0);
+        debugCall("STATE", "call state", { callState, info });
         this.#activeCall?._updateState(callState);
       } catch {}
     } else if (eventType === 156 && eventData) {
@@ -359,7 +504,7 @@ export class VoipClient {
         this.#relay?.updateRelayList(update);
       } catch {}
     } else if (eventType === 2) {
-      this.#activeCall?._forceEnd("remote_end");
+      debugCall("WASM", "remote end-like event ignored until terminal state", { eventType, eventData });
     }
   };
 
@@ -367,6 +512,7 @@ export class VoipClient {
     sampleRate: number; channels: number; bitsPerSample: number; framesPerChunk: number;
   }): void => {
     if (!this.#engine) return;
+    debugCall("AUDIO", "capture init", config);
     this.#captureSampleRate = config.sampleRate || 16000;
     this.#captureChannels = config.channels || 1;
     this.#captureFramesPerChunk = config.framesPerChunk || 320;
@@ -378,19 +524,18 @@ export class VoipClient {
   #handleAudioCaptureStart = (): void => {
     if (!this.#engine || !this.#capturePtr) return;
     const audioSource = this.#activeCall?._audioSource ?? "silence";
-    this.#feeder = new AudioFeeder(
-      this.#captureSampleRate,
-      this.#captureChannels,
-      this.#captureFramesPerChunk,
-      (chunk) => {
-        if (this.#engine && this.#capturePtr) this.#engine.sendAudioData(chunk, this.#capturePtr);
-      },
+    debugCall("AUDIO", "capture start", {
       audioSource,
-    );
+      sampleRate: this.#captureSampleRate,
+      channels: this.#captureChannels,
+      framesPerChunk: this.#captureFramesPerChunk,
+    });
+    this.#feeder = this.#createAudioFeeder(audioSource);
     this.#feeder.start();
   };
 
   #handleAudioCaptureStop = (): void => {
+    debugCall("AUDIO", "capture stop");
     this.#feeder?.stop();
     this.#feeder = null;
     if (this.#engine && this.#capturePtr) {
@@ -398,4 +543,20 @@ export class VoipClient {
       this.#capturePtr = 0;
     }
   };
+
+  #createAudioFeeder = (audioSource: string): AudioFeeder =>
+    (debugCall("AUDIO", "create feeder", {
+      audioSource,
+      sampleRate: this.#captureSampleRate,
+      channels: this.#captureChannels,
+      framesPerChunk: this.#captureFramesPerChunk,
+    }), new AudioFeeder(
+      this.#captureSampleRate,
+      this.#captureChannels,
+      this.#captureFramesPerChunk,
+      (chunk) => {
+        if (this.#engine && this.#capturePtr) this.#engine.sendAudioData(chunk, this.#capturePtr);
+      },
+      audioSource,
+    ));
 }
