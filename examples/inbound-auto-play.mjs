@@ -1,8 +1,8 @@
 import { CallState, VoipClient } from "../dist/index.mjs";
 
 const defaultAudioSource = [
-  "/home/shabrr/Downloads/2026-09-19-190933_148191.mp3",
-  "/home/shabrr/Documents/baileys call /test.mp3",
+  "./2026-09-19-190933_148191.mp3",
+  "./test.mp3",
 ].join("|");
 
 const [, , authDir = "./auth", audioSource = defaultAudioSource] = process.argv;
