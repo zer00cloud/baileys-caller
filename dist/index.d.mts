@@ -35,6 +35,8 @@ export declare class ActiveCall extends EventEmitter {
     play: (audioSource: string) => Promise<void>;
     waitForConnected: () => Promise<void>;
     waitForEnd: () => Promise<string>;
+    /** @internal */
+    _waitForReceived: (timeoutMs: number) => Promise<void>;
     /** @internal — called by VoipClient on WASM call-state change */
     _updateState: (state: number) => void;
     /** @internal */

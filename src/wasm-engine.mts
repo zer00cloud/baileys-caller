@@ -18,6 +18,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const CALL_WASM_AB_PROPS_JSON = process.env.CALL_WASM_AB_PROPS_JSON ?? "";
+const DEBUG_CALL_LOGS = process.env.DEBUG_CALL_LOGS === "1";
 const PTHREAD_POOL_SIZE = 20;
 const VOIP_READY_TIMEOUT_MS = 15_000;
 
@@ -90,6 +91,36 @@ const filterWorkerStderr = (chunk: Buffer): void => {
   const line = chunk.toString().trim();
   if (line && !line.startsWith("voip:") && !line.startsWith("still waiting")) {
     process.stderr.write(chunk);
+  }
+};
+
+const isParticipantKnownContact = (jid: unknown): boolean => {
+  const raw = String(jid ?? "").trim();
+  const result = true;
+  if (DEBUG_CALL_LOGS) {
+    console.log(`${new Date().toTimeString().slice(0, 8)} [CONTACT] lookup ${JSON.stringify({ jid: raw, result })}`);
+  }
+  return result;
+};
+
+const answerContactLookupSyncRequest = (data: any): boolean => {
+  const buffer = data?.buffer;
+  if (!buffer) return false;
+  try {
+    const view = new Int32Array(buffer);
+    const result = isParticipantKnownContact(data?.jid);
+    Atomics.store(view, 1, result ? 1 : 0);
+    Atomics.store(view, 0, 1);
+    Atomics.notify(view, 0, 1);
+    return true;
+  } catch (err) {
+    if (DEBUG_CALL_LOGS) {
+      console.log(`${new Date().toTimeString().slice(0, 8)} [CONTACT] lookup response failed ${JSON.stringify({
+        jid: String(data?.jid ?? ""),
+        error: err instanceof Error ? err.message : String(err),
+      })}`);
+    }
+    return false;
   }
 };
 
@@ -203,6 +234,11 @@ class NodeWorkerMessagePort {
         if (data.eventType !== undefined) listenerData.eventType = data.eventType;
         if (data.userData !== undefined) listenerData.userData = data.userData;
         if (data.eventDataJson !== undefined) listenerData.eventDataJson = data.eventDataJson;
+      }
+
+      if (callbackName === "contactLookupSyncRequest") {
+        answerContactLookupSyncRequest(listenerData);
+        return;
       }
 
       WasmEngine.notifyGlobalCallbackListeners(callbackName, listenerData);
@@ -523,16 +559,16 @@ export class WasmEngine {
   };
 
   handleSignalingOffer = (msg: {
-    payload: string; peerPlatform?: number; peerAppVersion?: string;
+    payload: string; peerPlatform?: string | number; peerAppVersion?: string;
     epochId?: string; timestamp?: string; isOffline?: boolean;
     isOfferNotContact?: boolean; peerJid: string; tcToken?: Uint8Array;
   }): void => {
     this.#ensureInitialized();
     const tcTokenList = this.#createUint8List(msg.tcToken);
     try {
-      this.#instance.handleIncomingSignalingOffer(
+      const result = this.#instance.handleIncomingSignalingOffer(
         msg.payload,
-        String(msg.peerPlatform ?? 0),
+        String(msg.peerPlatform ?? "0"),
         String(msg.peerAppVersion ?? "0"),
         String(msg.epochId ?? "0"),
         String(msg.timestamp ?? "0"),
@@ -541,6 +577,9 @@ export class WasmEngine {
         String(msg.peerJid),
         tcTokenList,
       );
+      if (DEBUG_CALL_LOGS) {
+        console.log(`${new Date().toTimeString().slice(0, 8)} [WASM] handleIncomingSignalingOffer returned ${JSON.stringify(result)}`);
+      }
     } finally {
       tcTokenList?.delete?.();
     }
@@ -1106,7 +1145,8 @@ export class WasmEngine {
         const hmacKey = new Uint8Array(data?.key_ ?? []);
         return callbacks.hmacSha256?.(hmacData, hmacKey) ?? new Uint8Array(32);
       },
-      isParticipantKnownContact: () => true,
+      isParticipantKnownContact: (data: any): boolean => isParticipantKnownContact(data?.jid),
+      contactLookupSyncRequest: (data: any): boolean => answerContactLookupSyncRequest(data),
       getPersistentDirectoryPath: (): string => {
         const dir = "/tmp/voip";
         try { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); } catch {}

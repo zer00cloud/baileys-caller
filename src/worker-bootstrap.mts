@@ -633,6 +633,32 @@ const e = new WorkerSyncedMessagePort((global as any).self, "VoipWebWasmWorker")
 
 type WhatsAppVoipWasmWorkerCompatibleCallbacks = Record<string, (...args: any[]) => unknown>;
 
+const resolveParticipantKnownContactSync = (jid: unknown): boolean => {
+  const buffer = new SharedArrayBuffer(8);
+  const view = new Int32Array(buffer);
+  Atomics.store(view, 0, 0);
+  Atomics.store(view, 1, 0);
+  e.postMessage({
+    type: "waWasmWorkerCompatibleCallback",
+    __name: "contactLookupSyncRequest",
+    jid: String(jid ?? ""),
+    buffer,
+  });
+  const waitResult = Atomics.wait(view, 0, 0, 5000);
+  if (waitResult === "timed-out") {
+    try {
+      e.postMessage({
+        type: "waWasmWorkerCompatibleCallback",
+        __name: "loggingCallback",
+        level: 2,
+        message: `voip: [Worker] isParticipantKnownContact(sync): ${String(jid ?? "")} timed out; defaulting known`,
+      });
+    } catch {}
+    return true;
+  }
+  return Atomics.load(view, 1) === 1;
+};
+
 (global as any).self.WhatsAppVoipWasmWorkerCompatibleCallbacks = {
   onSignalingXmpp: function (n: any) {
     e.postMessage({
@@ -802,8 +828,8 @@ type WhatsAppVoipWasmWorkerCompatibleCallbacks = Record<string, (...args: any[])
     return new Sha256HMacBuilder(a).update(r).finish();
   },
 
-  isParticipantKnownContact: function (_t: any) {
-    return false;
+  isParticipantKnownContact: function (t: any) {
+    return resolveParticipantKnownContactSync(t?.jid);
   },
 
   getPersistentDirectoryPath: function () {

@@ -2,14 +2,19 @@
  * Example: auto-answer an inbound voice call and play an audio file after media connects.
  *
  * Usage:
- *   npx tsx examples/inbound-auto-play.mts <authDir> <audioSource>
+ *   npx tsx examples/inbound-auto-play.mts <authDir> [audioSource]
  *
  * Example:
- *   npx tsx examples/inbound-auto-play.mts ./auth ./test.mp3
+ *   npx tsx examples/inbound-auto-play.mts ./auth
  */
-import { VoipClient } from "../src/index.mjs";
+import { CallState, VoipClient } from "../src/index.mjs";
 
-const [, , authDir = "./auth", audioSource = "./test.mp3"] = process.argv;
+const defaultAudioSource = [
+  "/home/shabrr/Downloads/2026-09-19-190933_148191.mp3",
+  "/home/shabrr/Documents/baileys call /test.mp3",
+].join("|");
+
+const [, , authDir = "./auth", audioSource = defaultAudioSource] = process.argv;
 
 const ts = (): string => new Date().toTimeString().slice(0, 8);
 const log = (scope: string, msg: string): void => {
@@ -32,6 +37,9 @@ client.on("incoming-call", async (call) => {
   call.on("audio", (pcm: Float32Array) => log("AUDIO", `#${n} incoming PCM frame samples=${pcm.length}`));
   call.on("ended", (reason: string) => log("CALL", `#${n} ended reason=${reason}; ready for next call`));
   call.on("error", (err: Error) => log("ERROR", `#${n} ${err.message}`));
+  if (call.state === CallState.ReceivedCall) {
+    log("STATE", `#${n} WASM entered ReceivedCall`);
+  }
 
   try {
     log("CALL", `#${n} answering like first call`);

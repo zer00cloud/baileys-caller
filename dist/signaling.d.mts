@@ -14,7 +14,7 @@ export type BaileysSocket = {
     query: (node: any) => Promise<any>;
     sendNode: (node: any) => Promise<void>;
     waitForMessage: (tag: string, timeoutMs: number) => Promise<any>;
-    getUSyncDevices: (jids: string[], ignoreZeroDevices: boolean, forceQuery: boolean) => Promise<any[]>;
+    getUSyncDevices: (jids: string[], useCache: boolean, ignoreZeroDevices: boolean) => Promise<any[]>;
     presenceSubscribe: (jid: string) => Promise<void>;
     ws: any;
     ev: any;

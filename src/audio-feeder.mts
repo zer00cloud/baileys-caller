@@ -19,6 +19,8 @@ const DEBUG_CALL_LOGS = process.env.DEBUG_CALL_LOGS === "1";
 
 export class AudioFeeder {
   #proc: ChildProcessWithoutNullStreams | null = null;
+  #running = false;
+  #inputEnded = false;
   #pending = Buffer.alloc(0);
   #queue: Float32Array[] = [];
   #emitTimer: NodeJS.Timeout | null = null;
@@ -40,7 +42,9 @@ export class AudioFeeder {
   ) {}
 
   start = (): void => {
-    if (this.#proc) return;
+    if (this.#running) return;
+    this.#running = true;
+    this.#inputEnded = false;
 
     const chunkSamples = this.framesPerChunk * this.channels;
     const chunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
@@ -86,6 +90,7 @@ export class AudioFeeder {
         process.stderr.write(`[AudioFeeder] ffmpeg exited with code=${code}\n`);
       }
       this.#proc = null;
+      this.#inputEnded = true;
     });
 
     this.#nextEmitAtMs = 0;
@@ -94,12 +99,14 @@ export class AudioFeeder {
   };
 
   stop = (): void => {
+    this.#running = false;
     if (this.#emitTimer) {
       clearTimeout(this.#emitTimer);
       this.#emitTimer = null;
     }
     this.#proc?.kill("SIGTERM");
     this.#proc = null;
+    this.#inputEnded = false;
     this.#pending = Buffer.alloc(0);
     this.#queue = [];
     this.#warmupUntilMs = 0;
@@ -112,11 +119,24 @@ export class AudioFeeder {
     if (this.source.startsWith("lavfi:")) {
       return ["-f", "lavfi", "-i", this.source.slice("lavfi:".length)];
     }
+    const playlist = this.source
+      .split("|")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (playlist.length > 1) {
+      const inputs = playlist.flatMap((item) => ["-i", item]);
+      const labels = playlist.map((_, index) => `[${index}:a]`).join("");
+      return [
+        ...inputs,
+        "-filter_complex", `${labels}concat=n=${playlist.length}:v=0:a=1[out]`,
+        "-map", "[out]",
+      ];
+    }
     return ["-stream_loop", "-1", "-i", this.source];
   };
 
   #scheduleNext = (chunkSamples: number, chunkIntervalMs: number): void => {
-    if (!this.#proc) return;
+    if (!this.#running) return;
     const now = Date.now();
     if (this.#nextEmitAtMs === 0) this.#nextEmitAtMs = now;
     const delayMs = Math.max(0, this.#nextEmitAtMs - now);
@@ -149,7 +169,7 @@ export class AudioFeeder {
         `[AudioFeeder] emitted=${this.chunksEmitted} queued=${this.#queue.length} peak=${peak.toFixed(4)} underflow=${this.underflowChunks}\n`,
       );
     }
-    if (this.#proc?.stdout.isPaused() && this.#queue.length <= MAX_QUEUED_CHUNKS / 4) {
+    if (!this.#inputEnded && this.#proc?.stdout.isPaused() && this.#queue.length <= MAX_QUEUED_CHUNKS / 4) {
       this.#proc.stdout.resume();
     }
   };

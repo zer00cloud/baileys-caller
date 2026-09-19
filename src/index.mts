@@ -25,6 +25,7 @@ export { CallState } from "./types.mjs";
 
 const SHA256_LEN = 32;
 const DEBUG_CALL_LOGS = process.env.DEBUG_CALL_LOGS === "1";
+const INBOUND_RECEIVED_TIMEOUT_MS = 8_000;
 
 const debugCall = (scope: string, message: string, data?: unknown): void => {
   if (!DEBUG_CALL_LOGS) return;
@@ -177,6 +178,7 @@ export class ActiveCall extends EventEmitter {
         }),
       ]);
     }
+    debugCall("CALL-TX", "answer", { callId: this.callId });
     const result = this.engine.acceptCall(opts.mic ?? true, opts.camera ?? false);
     debugCall("WASM", "acceptCall returned", { result });
   };
@@ -198,16 +200,44 @@ export class ActiveCall extends EventEmitter {
 
   waitForEnd = (): Promise<string> => this.#endPromise;
 
+  /** @internal */
+  _waitForReceived = (timeoutMs: number): Promise<void> => {
+    if (this.#state === CallState.ReceivedCall || this.#state === CallState.AcceptSent || this.#state === CallState.Active) {
+      return Promise.resolve();
+    }
+    return Promise.race([
+      this.#receivedPromise,
+      this.#endPromise.then((reason) => {
+        throw new Error(`Call ended before it could be answered: ${reason}`);
+      }),
+      new Promise<void>((_, reject) => {
+        setTimeout(() => reject(new Error(`Timed out waiting for inbound call to become answerable`)), timeoutMs);
+      }),
+    ]);
+  };
+
   /** @internal — called by VoipClient on WASM call-state change */
   _updateState = (state: number): void => {
     this.#state = state as CallState;
     if (state === CallState.PreacceptReceived) this.emit("ringing");
     else if (state === CallState.ReceivedCall) {
+      debugCall("CALL-STATE", "answerable", {
+        callId: this.callId,
+        offerReceived: true,
+        peerResolved: true,
+        deviceResolved: true,
+        sessionReady: true,
+        answerable: true,
+      });
       this.emit("received");
       this.#receivedResolver();
     }
-    else if (state === CallState.AcceptSent) this.emit("answering");
+    else if (state === CallState.AcceptSent) {
+      debugCall("CALL", "answer sent", { callId: this.callId });
+      this.emit("answering");
+    }
     else if (state === CallState.Active) {
+      debugCall("CALL", "answered", { callId: this.callId });
       this.emit("connected");
       this.#connectedResolver();
     }
@@ -484,7 +514,23 @@ export class VoipClient extends EventEmitter {
     await this.#signaling.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
 
     if (callToEmit) {
-      this.emit("incoming-call", callToEmit);
+      try {
+        await callToEmit._waitForReceived(INBOUND_RECEIVED_TIMEOUT_MS);
+        this.emit("incoming-call", callToEmit);
+      } catch (err) {
+        debugCall("CALL", "incoming offer did not become answerable", {
+          callId: callToEmit.callId,
+          from: callToEmit.from,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        try { callToEmit._forceEnd("not_answerable"); } catch {}
+        if (this.#activeCall === callToEmit) {
+          this.#resetCallMedia();
+          try { this.#relay?.noteCallEnded(); } catch {}
+          try { this.#signaling?.clearCallState(callToEmit.callId); } catch {}
+          this.#activeCall = null;
+        }
+      }
     }
   };
 

@@ -30,7 +30,7 @@ const loadBaileys = async () => {
         throw new Error("Could not import @whiskeysockets/baileys. Install it as a peer dependency.");
     }
 };
-const getNodeChildren = (node) => Array.isArray(node.content) ? node.content : [];
+const getNodeChildren = (node) => Array.isArray(node?.content) ? node.content : [];
 const setNodeChildren = (node, children) => {
     node.content = children.length ? children : undefined;
 };
@@ -50,6 +50,44 @@ const parseCountAttr = (value, fallback = 0) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : fallback;
 };
+const hasDeviceSuffix = (jid) => /:\d+@/.test(String(jid ?? ""));
+const usableInboundPeerNeedsDiscovery = (...jids) => {
+    const usable = jids.map((jid) => String(jid ?? "").trim()).filter(Boolean);
+    return usable.length > 0 && usable.every((jid) => !hasDeviceSuffix(jid));
+};
+const normalizePeerPlatform = (platform) => {
+    const raw = String(platform ?? "").trim().toLowerCase();
+    const numeric = Number(raw);
+    if (Number.isFinite(numeric))
+        return numeric;
+    if (raw === "android")
+        return 0;
+    if (raw === "iphone" || raw === "ios")
+        return 1;
+    if (raw === "web")
+        return 14;
+    return 0;
+};
+const describeBinaryNodeShape = (node) => ({
+    tag: node?.tag,
+    attrs: node?.attrs ?? {},
+    content: node?.content instanceof Uint8Array ? { binary: true, length: node.content.length } :
+        Buffer.isBuffer(node?.content) ? { binary: true, length: node.content.length } :
+            Array.isArray(node?.content) ? node.content.map(describeBinaryNodeShape) :
+                node?.content == null ? undefined :
+                    { type: typeof node.content },
+});
+const getEncShape = (structure) => {
+    const enc = Array.isArray(structure?.content)
+        ? structure.content.find((child) => child?.tag === "enc")
+        : undefined;
+    if (!enc)
+        return undefined;
+    return {
+        attrs: enc.attrs ?? {},
+        length: enc.content?.binary ? enc.content.length : undefined,
+    };
+};
 export class SignalingBridge {
     #sock;
     #baileys = null;
@@ -61,6 +99,7 @@ export class SignalingBridge {
     #remoteObfuscatedPeerByCallId = new Map();
     #remoteXmppRoutePeerByCallId = new Map();
     #incomingCallPeerById = new Map();
+    #lastOfferTrace = null;
     #outgoingSignalingQueue = Promise.resolve(undefined);
     #incomingSignalingQueue = Promise.resolve(undefined);
     constructor(config) {
@@ -151,7 +190,7 @@ export class SignalingBridge {
         return undefined;
     };
     discoverPeerDevices = async (peerLidJid) => {
-        const devices = await this.#sock.getUSyncDevices([peerLidJid], true, false);
+        const devices = await this.#sock.getUSyncDevices([peerLidJid], false, true);
         return this.#normalizeStartCallPeerList(devices.map((d) => d.jid).filter(Boolean));
     };
     ensureSessionsForPeers = async (jids) => {
@@ -333,16 +372,41 @@ export class SignalingBridge {
             String(node.attrs.from ?? "") ||
             String(voipChild.attrs["call-creator"] ?? "");
         const callbackPeerJid = String(node.attrs.from ?? "") || senderDeviceJid;
+        const callerPnJid = String(voipChild.attrs.caller_pn ?? voipChild.attrs.callerPn ?? "");
+        const isOfferNotContact = false;
+        const normalizedLid = senderDeviceJid.endsWith("@lid") ? this.#toBareJid(senderDeviceJid) : "";
+        const normalizedPn = callerPnJid || (!senderDeviceJid.endsWith("@lid") ? this.#toBareJid(senderDeviceJid) : "");
+        if (voipChild.tag === "offer") {
+            debugCall("CALL", "incoming", { callId: callIdForRouting });
+            debugCall("OFFER-STRUCTURE", "safe tree", describeBinaryNodeShape(voipChild));
+            debugCall("IDENTITY", "resolved inbound identity", {
+                sender: senderDeviceJid,
+                callCreator: String(voipChild.attrs["call-creator"] ?? ""),
+                callerPn: callerPnJid,
+                normalizedLid,
+                normalizedPn,
+            });
+        }
         const platform = voipChild.attrs.platform ?? node.attrs.platform ?? "";
         const appVersion = voipChild.attrs.version ?? node.attrs.version ?? "";
         const epochId = voipChild.attrs.e ?? node.attrs.e ?? "0";
         const timestamp = voipChild.attrs.t ?? node.attrs.t ?? "0";
         const offline = !!(voipChild.attrs.offline ?? node.attrs.offline);
+        const discoveredDeviceJids = usableInboundPeerNeedsDiscovery(senderDeviceJid, callbackPeerJid)
+            ? await this.#discoverInboundDeviceJids(senderDeviceJid, callbackPeerJid, callerPnJid)
+            : [];
+        if (voipChild.tag === "offer") {
+            await this.#logDeviceAndSessionCache([
+                senderDeviceJid,
+                callbackPeerJid,
+                callerPnJid,
+                ...discoveredDeviceJids,
+            ]);
+        }
         let usableNode = voipChild;
         if (getBinaryNodeChild(voipChild, "enc")) {
-            usableNode = await this.#maybeDecryptEnc(voipChild, senderDeviceJid);
+            usableNode = await this.#maybeDecryptEnc(voipChild, senderDeviceJid, [...discoveredDeviceJids, callerPnJid]);
         }
-        const b64 = Buffer.from(encodeBinaryNode(usableNode)).toString("base64");
         const storedPeerJid = callIdForRouting ? this.#incomingCallPeerById.get(callIdForRouting) : undefined;
         let mappedRemoteDeviceJid = callIdForRouting ? this.#remoteDevicePeerByCallId.get(callIdForRouting) : undefined;
         if (callIdForRouting && (callbackPeerJid || senderDeviceJid)) {
@@ -354,31 +418,53 @@ export class SignalingBridge {
             }
         }
         const routedPeerJid = usableNode.tag === "offer"
-            ? this.#preferDeviceRouteJid(senderDeviceJid, callbackPeerJid, storedPeerJid)
-            : this.#preferOrderedRouteJid(mappedRemoteDeviceJid, storedPeerJid, senderDeviceJid, callbackPeerJid);
+            ? this.#preferOfferPeerJid(senderDeviceJid, callbackPeerJid, storedPeerJid, ...discoveredDeviceJids)
+            : this.#preferOrderedRouteJid(storedPeerJid, mappedRemoteDeviceJid, senderDeviceJid, callbackPeerJid);
+        const wasmPeerJid = usableNode.tag === "offer"
+            ? this.#prepareInboundOfferForWasm(usableNode, routedPeerJid, senderDeviceJid, callbackPeerJid)
+            : routedPeerJid;
+        const b64 = Buffer.from(encodeBinaryNode(usableNode)).toString("base64");
         if (callIdForRouting && routedPeerJid) {
-            this.#incomingCallPeerById.set(callIdForRouting, routedPeerJid);
+            this.#incomingCallPeerById.set(callIdForRouting, wasmPeerJid || routedPeerJid);
+            if (this.#hasConcreteDevice(wasmPeerJid || routedPeerJid)) {
+                this.#remoteDevicePeerByCallId.set(callIdForRouting, wasmPeerJid || routedPeerJid);
+            }
+        }
+        if (usableNode.tag === "offer") {
+            debugCall("DEVICE", "selected", {
+                callId: callIdForRouting,
+                discovered: discoveredDeviceJids,
+                routeSelected: routedPeerJid,
+                wasmSelected: wasmPeerJid,
+            });
+            debugCall("CALL-STATE", "inbound resolution", {
+                callId: callIdForRouting,
+                offerReceived: true,
+                peerResolved: !!routedPeerJid,
+                deviceResolved: this.#hasConcreteDevice(wasmPeerJid),
+                sessionReady: false,
+                answerable: false,
+            });
         }
         const tcToken = await this.ensureTcToken(routedPeerJid, callbackPeerJid);
         switch (usableNode.tag) {
             case "offer":
-                debugCall("SIGNAL", "handle offer", {
+                await this.#handleOffer(voip, {
+                    payload: b64,
+                    structure: describeBinaryNodeShape(usableNode),
                     callId: callIdForRouting,
                     routedPeerJid,
+                    wasmPeerJid,
                     senderDeviceJid,
                     callbackPeerJid,
+                    callerPnJid,
+                    discoveredDeviceJids,
+                    isOfferNotContact,
                     platform,
                     appVersion,
-                });
-                voip.handleSignalingOffer({
-                    payload: b64,
-                    peerPlatform: Number(platform || 0),
-                    peerAppVersion: appVersion,
-                    epochId, timestamp,
-                    isOffline: offline,
-                    isOfferNotContact: false,
-                    peerJid: routedPeerJid,
-                    tcToken,
+                    epochId,
+                    timestamp,
+                    offline,
                 });
                 break;
             case "ack":
@@ -441,7 +527,77 @@ export class SignalingBridge {
             tcToken,
         });
     };
-    #maybeDecryptEnc = async (voipNode, peerJid) => {
+    #handleOffer = async (voip, opts) => {
+        const routePeerJid = opts.routedPeerJid;
+        const peerJid = opts.wasmPeerJid || routePeerJid;
+        const tcToken = await this.ensureTcToken(routePeerJid, peerJid, opts.callbackPeerJid, opts.callerPnJid);
+        const input = {
+            callId: opts.callId,
+            routePeerJid,
+            peerJid,
+            peerParsed: this.#describeJid(peerJid),
+            senderDeviceJid: opts.senderDeviceJid,
+            senderParsed: this.#describeJid(opts.senderDeviceJid),
+            callbackPeerJid: opts.callbackPeerJid,
+            callbackParsed: this.#describeJid(opts.callbackPeerJid),
+            callCreator: opts.structure?.attrs?.["call-creator"] ?? opts.senderDeviceJid,
+            callerPn: opts.callerPnJid,
+            platform: opts.platform,
+            normalizedPlatform: normalizePeerPlatform(opts.platform),
+            appVersion: opts.appVersion,
+            isOfferNotContact: opts.isOfferNotContact,
+            tcTokenPresent: !!tcToken?.length,
+            offerChildTags: Array.isArray(opts.structure?.content)
+                ? opts.structure.content.map((child) => child?.tag)
+                : [],
+            offerEnc: getEncShape(opts.structure),
+        };
+        debugCall("SESSION", "ready", { callId: opts.callId, peerJid, tcToken: !!tcToken?.length });
+        debugCall("WASM-OFFER-INPUT", "safe args", input);
+        this.#logOfferDiff({
+            kind: this.#hasConcreteDevice(opts.senderDeviceJid) || String(opts.platform).toLowerCase() === "web" ? "success" : "failure",
+            input,
+            structure: opts.structure,
+        });
+        if (opts.callId && peerJid)
+            this.#incomingCallPeerById.set(opts.callId, peerJid);
+        try {
+            voip.handleSignalingOffer({
+                payload: opts.payload,
+                peerPlatform: opts.platform,
+                peerAppVersion: opts.appVersion,
+                epochId: opts.epochId,
+                timestamp: opts.timestamp,
+                isOffline: opts.offline,
+                isOfferNotContact: opts.isOfferNotContact,
+                peerJid,
+                tcToken,
+            });
+        }
+        catch (err) {
+            debugCall("SIGNAL", "handle offer failed", {
+                callId: opts.callId,
+                peerJid,
+                isOfferNotContact: opts.isOfferNotContact,
+                error: err instanceof Error ? err.message : String(err),
+            });
+        }
+    };
+    #logOfferDiff = (trace) => {
+        const previous = this.#lastOfferTrace;
+        this.#lastOfferTrace = trace;
+        if (!previous || previous.kind === trace.kind)
+            return;
+        const diff = {};
+        for (const key of [...new Set([...Object.keys(previous.input), ...Object.keys(trace.input)])]) {
+            const a = previous.input[key];
+            const b = trace.input[key];
+            if (JSON.stringify(a) !== JSON.stringify(b))
+                diff[key] = { previous: a, current: b };
+        }
+        debugCall("WASM-OFFER-DIFF", `${previous.kind} vs ${trace.kind}`, diff);
+    };
+    #maybeDecryptEnc = async (voipNode, peerJid, extraPeerJids = []) => {
         const { getBinaryNodeChild, unpadRandomMax16, proto } = this.#baileys;
         const enc = getBinaryNodeChild(voipNode, "enc");
         if (!enc || !(enc.content instanceof Uint8Array))
@@ -449,10 +605,21 @@ export class SignalingBridge {
         const type = enc.attrs.type;
         if (type !== "pkmsg" && type !== "msg")
             return voipNode;
-        const candidates = [...new Set([peerJid, this.#toCallDeviceJid(peerJid)])].filter(Boolean);
+        const candidates = [...new Set([
+                peerJid,
+                ...extraPeerJids,
+                this.#toCallDeviceJid(peerJid),
+                ...extraPeerJids.map((jid) => this.#toCallDeviceJid(jid)),
+            ])].filter(Boolean);
         const tryCandidates = async () => {
             for (const jid of candidates) {
                 try {
+                    debugCall("ENC", "inbound decrypt attempt", {
+                        jid,
+                        jidParsed: this.#describeJid(jid),
+                        type,
+                        ciphertextLength: enc.content.length,
+                    });
                     const decrypted = await this.#sock.signalRepository.decryptMessage({
                         jid, type, ciphertext: enc.content,
                     });
@@ -461,7 +628,18 @@ export class SignalingBridge {
                     if (!callKey || callKey.length === 0) {
                         throw new Error("decrypted signaling has no call.callKey");
                     }
+                    debugCall("ENC", "inbound decrypt success", {
+                        jid,
+                        protoFields: Object.keys(parsed ?? {}),
+                        callKeyLength: callKey.length,
+                    });
+                    const { type: _encryptedType, ...clearAttrs } = enc.attrs ?? {};
+                    enc.attrs = clearAttrs;
                     enc.content = callKey;
+                    debugCall("ENC", "wasm enc shape", {
+                        attrs: enc.attrs,
+                        contentLength: enc.content.length,
+                    });
                     return true;
                 }
                 catch (err) {
@@ -591,6 +769,27 @@ export class SignalingBridge {
         });
         setNodeChildren(voipNode, children);
     };
+    #discoverInboundDeviceJids = async (...jids) => {
+        const bareJids = [...new Set(jids
+                .map((jid) => this.#toBareJid(String(jid ?? "").trim()))
+                .filter(Boolean))];
+        if (!bareJids.length)
+            return [];
+        try {
+            const devices = await this.#sock.getUSyncDevices(bareJids, false, false);
+            const deviceJids = this.#normalizeStartCallPeerList(devices.map((device) => device.jid).filter(Boolean))
+                .filter(Boolean);
+            debugCall("SIGNAL", "discovered inbound devices", { bareJids, deviceJids });
+            return deviceJids;
+        }
+        catch (err) {
+            debugCall("SIGNAL", "failed to discover inbound devices", {
+                bareJids,
+                error: err instanceof Error ? err.message : String(err),
+            });
+            return [];
+        }
+    };
     // ─── private — JID utilities ──────────────────────────────────────────────
     #toBareJid = (jid) => {
         const { jidDecode, jidEncode } = this.#baileys;
@@ -599,6 +798,95 @@ export class SignalingBridge {
             return jid;
         const server = jid.endsWith("@lid") ? "lid" : "s.whatsapp.net";
         return jidEncode(decoded.user, server);
+    };
+    #jidUser = (jid) => {
+        const decoded = this.#baileys.jidDecode(jid);
+        return decoded?.user ? String(decoded.user) : "";
+    };
+    #describeJid = (jid) => {
+        const raw = String(jid ?? "").trim();
+        const decoded = this.#baileys.jidDecode(raw);
+        return {
+            raw,
+            user: decoded?.user,
+            server: decoded?.server,
+            device: decoded?.device,
+            isDeviceAddressed: decoded?.device != null,
+        };
+    };
+    #logDeviceAndSessionCache = async (jids) => {
+        const normalized = [...new Set(jids.map((jid) => String(jid ?? "").trim()).filter(Boolean))];
+        const users = [...new Set(normalized.map((jid) => this.#jidUser(jid)).filter(Boolean))];
+        try {
+            const cachedDevices = users.length ? await this.#sock.authState.keys.get("device-list", users) : {};
+            for (const jid of normalized) {
+                const user = this.#jidUser(jid);
+                debugCall("DEVICE-CACHE", "state", {
+                    jid,
+                    user,
+                    cachedDevices: user ? cachedDevices[user] : undefined,
+                    source: "authState.keys",
+                });
+            }
+        }
+        catch (err) {
+            debugCall("DEVICE-CACHE", "read failed", {
+                jids: normalized,
+                error: err instanceof Error ? err.message : String(err),
+            });
+        }
+        for (const jid of normalized) {
+            try {
+                const validation = await this.#sock.signalRepository.validateSession(jid);
+                debugCall("SESSION-CACHE", "state", { jid, exists: !!validation?.exists });
+            }
+            catch (err) {
+                debugCall("SESSION-CACHE", "read failed", {
+                    jid,
+                    error: err instanceof Error ? err.message : String(err),
+                });
+            }
+        }
+    };
+    #prepareInboundOfferForWasm = (offerNode, routedPeerJid, senderDeviceJid, callbackPeerJid) => {
+        const explicitPeerJid = this.#toExplicitPrimaryDeviceJid(routedPeerJid) ||
+            this.#toExplicitPrimaryDeviceJid(senderDeviceJid) ||
+            this.#toExplicitPrimaryDeviceJid(callbackPeerJid) ||
+            routedPeerJid;
+        if (!explicitPeerJid || explicitPeerJid === routedPeerJid)
+            return routedPeerJid;
+        const barePeerJid = this.#toBareJid(explicitPeerJid);
+        if (offerNode?.attrs?.["call-creator"] === barePeerJid) {
+            offerNode.attrs["call-creator"] = explicitPeerJid;
+        }
+        if (offerNode?.attrs?.participant === barePeerJid) {
+            offerNode.attrs.participant = explicitPeerJid;
+        }
+        const relay = getNodeChildren(offerNode).find((child) => child?.tag === "relay");
+        for (const child of getNodeChildren(relay)) {
+            if (child?.tag === "participant" && child.attrs?.jid === barePeerJid) {
+                child.attrs.jid = explicitPeerJid;
+            }
+        }
+        debugCall("IDENTITY", "prepared wasm primary device identity", {
+            routedPeerJid,
+            wasmPeerJid: explicitPeerJid,
+            barePeerJid,
+            callCreator: offerNode?.attrs?.["call-creator"],
+            relayParticipants: getNodeChildren(relay)
+                .filter((child) => child?.tag === "participant")
+                .map((child) => child.attrs?.jid),
+        });
+        return explicitPeerJid;
+    };
+    #toExplicitPrimaryDeviceJid = (jid) => {
+        const decoded = this.#baileys.jidDecode(String(jid ?? "").trim());
+        if (!decoded?.user || decoded.device != null)
+            return "";
+        const server = jid.endsWith("@lid") ? "lid" : jid.endsWith("@s.whatsapp.net") ? "s.whatsapp.net" : decoded.server;
+        if (server !== "lid" && server !== "s.whatsapp.net")
+            return "";
+        return `${decoded.user}:0@${server}`;
     };
     #toCallDeviceJid = (jid) => {
         const { jidDecode, jidEncode } = this.#baileys;
@@ -654,11 +942,22 @@ export class SignalingBridge {
         }
         return "";
     };
+    #preferOfferPeerJid = (...candidates) => {
+        for (const c of candidates) {
+            const jid = String(c ?? "").trim();
+            if (jid)
+                return this.#toCallDeviceJid(jid);
+        }
+        return "";
+    };
     #resolveOutboundPeerJid = (callId, wasmPeerJid) => {
         const peerJid = String(wasmPeerJid ?? "").trim();
         if (!peerJid || !callId)
             return peerJid;
-        return this.#remoteDevicePeerByCallId.get(callId) ?? peerJid;
+        return this.#remoteDevicePeerByCallId.get(callId) ??
+            this.#incomingCallPeerById.get(callId) ??
+            this.#remoteXmppRoutePeerByCallId.get(callId) ??
+            peerJid;
     };
     #expandSignalSessionTargets = (jids) => [...new Set(jids.flatMap((jid) => {
             const primary = this.#toPrimaryDeviceJid(jid);

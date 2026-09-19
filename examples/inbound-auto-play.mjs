@@ -1,6 +1,11 @@
-import { VoipClient } from "../dist/index.mjs";
+import { CallState, VoipClient } from "../dist/index.mjs";
 
-const [, , authDir = "./auth", audioSource = "./test.mp3"] = process.argv;
+const defaultAudioSource = [
+  "/home/shabrr/Downloads/2026-09-19-190933_148191.mp3",
+  "/home/shabrr/Documents/baileys call /test.mp3",
+].join("|");
+
+const [, , authDir = "./auth", audioSource = defaultAudioSource] = process.argv;
 
 const ts = () => new Date().toTimeString().slice(0, 8);
 const log = (scope, msg) => {
@@ -23,6 +28,9 @@ client.on("incoming-call", async (call) => {
   call.on("audio", (pcm) => log("AUDIO", `#${n} incoming PCM frame samples=${pcm.length}`));
   call.on("ended", (reason) => log("CALL", `#${n} ended reason=${reason}; ready for next call`));
   call.on("error", (err) => log("ERROR", `#${n} ${err.message}`));
+  if (call.state === CallState.ReceivedCall) {
+    log("STATE", `#${n} WASM entered ReceivedCall`);
+  }
 
   try {
     log("CALL", `#${n} answering like first call`);

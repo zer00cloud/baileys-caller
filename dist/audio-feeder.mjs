@@ -21,6 +21,8 @@ export class AudioFeeder {
     onChunk;
     source;
     #proc = null;
+    #running = false;
+    #inputEnded = false;
     #pending = Buffer.alloc(0);
     #queue = [];
     #emitTimer = null;
@@ -39,8 +41,10 @@ export class AudioFeeder {
         this.source = source;
     }
     start = () => {
-        if (this.#proc)
+        if (this.#running)
             return;
+        this.#running = true;
+        this.#inputEnded = false;
         const chunkSamples = this.framesPerChunk * this.channels;
         const chunkBytes = chunkSamples * Float32Array.BYTES_PER_ELEMENT;
         const chunkIntervalMs = (this.framesPerChunk / this.sampleRate) * 1000;
@@ -80,18 +84,21 @@ export class AudioFeeder {
                 process.stderr.write(`[AudioFeeder] ffmpeg exited with code=${code}\n`);
             }
             this.#proc = null;
+            this.#inputEnded = true;
         });
         this.#nextEmitAtMs = 0;
         this.#warmupUntilMs = Date.now() + DEFAULT_WARMUP_MS;
         this.#scheduleNext(chunkSamples, chunkIntervalMs);
     };
     stop = () => {
+        this.#running = false;
         if (this.#emitTimer) {
             clearTimeout(this.#emitTimer);
             this.#emitTimer = null;
         }
         this.#proc?.kill("SIGTERM");
         this.#proc = null;
+        this.#inputEnded = false;
         this.#pending = Buffer.alloc(0);
         this.#queue = [];
         this.#warmupUntilMs = 0;
@@ -103,10 +110,23 @@ export class AudioFeeder {
         if (this.source.startsWith("lavfi:")) {
             return ["-f", "lavfi", "-i", this.source.slice("lavfi:".length)];
         }
+        const playlist = this.source
+            .split("|")
+            .map((item) => item.trim())
+            .filter(Boolean);
+        if (playlist.length > 1) {
+            const inputs = playlist.flatMap((item) => ["-i", item]);
+            const labels = playlist.map((_, index) => `[${index}:a]`).join("");
+            return [
+                ...inputs,
+                "-filter_complex", `${labels}concat=n=${playlist.length}:v=0:a=1[out]`,
+                "-map", "[out]",
+            ];
+        }
         return ["-stream_loop", "-1", "-i", this.source];
     };
     #scheduleNext = (chunkSamples, chunkIntervalMs) => {
-        if (!this.#proc)
+        if (!this.#running)
             return;
         const now = Date.now();
         if (this.#nextEmitAtMs === 0)
@@ -137,7 +157,7 @@ export class AudioFeeder {
             const peak = nextChunk.reduce((max, sample) => Math.max(max, Math.abs(sample)), 0);
             process.stderr.write(`[AudioFeeder] emitted=${this.chunksEmitted} queued=${this.#queue.length} peak=${peak.toFixed(4)} underflow=${this.underflowChunks}\n`);
         }
-        if (this.#proc?.stdout.isPaused() && this.#queue.length <= MAX_QUEUED_CHUNKS / 4) {
+        if (!this.#inputEnded && this.#proc?.stdout.isPaused() && this.#queue.length <= MAX_QUEUED_CHUNKS / 4) {
             this.#proc.stdout.resume();
         }
     };
